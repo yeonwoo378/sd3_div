@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from utils import *
 from pipelines.sd3 import sd3_timestep_pipe, update, decode_latent
 
-D = 16 * 64 * 64  # latent dimension (per sample)
+D = 16 * 64 * 64  # latent dimension (per sample) SD3
 
 
 def _make_hutchinson_eps_like(x: torch.Tensor, generator: torch.Generator, dist: str = "gaussian"):
@@ -40,6 +40,7 @@ def estimate_divergence_hutchinson(
     eps_list,
     guidance_scale: float = 7.0,
     device: str = "cuda",
+    return_pred = True
 ):
     """
     Returns scalar divergence estimate:
@@ -67,30 +68,35 @@ def estimate_divergence_hutchinson(
     div_total = torch.zeros((), device=x.device, dtype=torch.float32)
 
     n = len(eps_list)
-    for s, eps in enumerate(eps_list):
-        # Important: eps should not require grad
-        eps = eps.detach()
 
-        # scalar: <pred, eps> / D  (divide-by-D is optional; keeps scale tame)
-        vp = torch.sum(pred * eps) / D
+    assert n == 1
+    with torch.enable_grad():
+        for s, eps in enumerate(eps_list):
+            # Important: eps should not require grad
+            eps = eps.detach()
 
-        # vjp = d/dx vp = (J^T eps) / D
-        # retain_graph must be True except for the last probe, because we reuse the same forward graph.
-        vjp = torch.autograd.grad(
-            vp,
-            x,
-            retain_graph=(s != n - 1),
-            create_graph=False,
-            allow_unused=False,
-        )[0]
+            # scalar: <pred, eps> / D  (divide-by-D is optional; keeps scale tame)
+            vp = torch.sum(pred * eps) / D
 
-        # eps^T J eps / D
-        div_s = torch.sum(vjp * eps).to(torch.float32)
-        div_total = div_total + div_s
+            # vjp = d/dx vp = (J^T eps) / D
+            # retain_graph must be True except for the last probe, because we reuse the same forward graph.
+            vjp = torch.autograd.grad(
+                vp,
+                x,
+                # retain_graph=(s != n - 1),
+                create_graph=False,
+                allow_unused=False,
+            )[0]
+
+            # eps^T J eps / D
+            div_s = torch.sum(vjp * eps).to(torch.float32)
+            div_total = div_total + div_s
 
     div_avg = div_total / float(n)
 
     # Return scalar tensor (float32)
+    if return_pred:
+        return div_avg, pred
     return div_avg
 
 
@@ -180,21 +186,7 @@ def main(args):
                 lr = args.lr * (1 - (i / len(timesteps)) ** (1.0 / 3.0))
             elif args.lr_schedule == "constant":
                 lr = args.lr
-            elif args.lr_schedule == "custom1":
-                if i < len(timesteps) * 0.2:
-                    lr = args.lr * 10
-                else:
-                    lr = args.lr * (1 - (i / len(timesteps)) ** (1.0 / 3.0))
-            elif args.lr_schedule == "custom2":
-                if i < len(timesteps) * 0.2:
-                    lr = args.lr * 10
-                elif i < len(timesteps) * 0.5:
-                    lr = args.lr
-                else:
-                    lr = 0.0
-            elif "t_only" in args.lr_schedule:
-                target_t = int(args.lr_schedule.split("_")[-1])
-                lr = args.lr * 50 if i == target_t else 0.0
+ 
             else:
                 raise ValueError(f"Unknown lr_schedule: {args.lr_schedule}")
 
@@ -210,11 +202,14 @@ def main(args):
             #
             # NOTE: num_iters here acts as "number of extra proposals" (baseline always included).
             #
+            best_latents = latents.detach()
+            best_div = None
+            best_pred = None
 
             if args.num_iters > 0 and lr > 0.0 and args.noise_scale > 0.0:
                 # Generators for reproducibility per (prompt, timestep)
                 eps_gen = torch.Generator("cuda").manual_seed(args.seed + 100000 * prompt_idx + 10 * i + 1)
-                prop_gen = torch.Generator("cuda").manual_seed(args.seed + 100000 * prompt_idx + 10 * i + 2)
+                prop_gen = torch.Generator("cuda").manual_seed(args.seed + 100000 * prompt_idx + 10 * i + 1)
 
                 # Hutchinson probes (shared across all candidate latents at this timestep)
                 eps_list = [
@@ -223,67 +218,71 @@ def main(args):
                 ]
 
                 # Baseline candidate (no perturb)
-                best_latents = latents.detach()
-                with torch.enable_grad():
-                    base_div = estimate_divergence_hutchinson(
-                        pipe,
-                        best_latents,
-                        prompt_embeds,
-                        pooled_prompt_embeds,
-                        t,
-                        eps_list,
-                        guidance_scale=7.0,
-                        device="cuda",
-                    )
-                best_obj = divergence_objective(base_div, args.optimize_target).detach()
+                # best_latents = latents.detach()
+                # with torch.enable_grad():
+                best_div, best_pred = estimate_divergence_hutchinson(
+                    pipe,
+                    best_latents,
+                    prompt_embeds,
+                    pooled_prompt_embeds,
+                    t,
+                    eps_list,
+                    guidance_scale=7.0,
+                    device="cuda",
+                )
+                # best_div = divergence_objective(base_div, args.optimize_target).detach()
 
                 # Proposals around current latents
                 # Use lr to scale proposal radius while keeping args.noise_scale as base.
                 sigma = float(lr) * float(args.noise_scale)
 
-                for _ in range(args.num_iters):
-                    if args.t_until != -1 and i > args.t_until:
-                        break  # skip corrector after t_until
-                    if i!=0:
-                        proposal = best_latents + sigma * torch.randn(best_latents.shape,  device=best_latents.device, dtype=best_latents.dtype, generator=prop_gen)
-                    else:
-                        # geodesic interpolation at t=0
-                        proposal = best_latents * (1 - sigma) + torch.randn(best_latents.shape, device=best_latents.device, dtype=best_latents.dtype, generator=prop_gen) * sigma
+            for iter in range(args.num_iters+1):
+                # if args.t_until != -1 and i > args.t_until:
+                #     break  # skip corrector after t_until
+                if iter == 0:
+                    proposal = best_latents
+                elif i!=0:
+                    proposal = best_latents + sigma * torch.randn(best_latents.shape,  device=best_latents.device, dtype=best_latents.dtype, generator=prop_gen)
+                else:
+                    # geodesic interpolation at t=0
+                    proposal = best_latents * (1 - sigma) + sigma * torch.randn(best_latents.shape, device=best_latents.device, dtype=best_latents.dtype, generator=prop_gen) 
 
-                    with torch.enable_grad():
-                        div_val = estimate_divergence_hutchinson(
-                            pipe,
-                            proposal,
-                            prompt_embeds,
-                            pooled_prompt_embeds,
-                            t,
-                            eps_list,
-                            guidance_scale=7.0,
-                            device="cuda",
-                        )
-                    obj = divergence_objective(div_val, args.optimize_target).detach()
-
-                    if obj.item() < best_obj.item():
-                        best_obj = obj
-                        best_latents = proposal.detach()
-
-                latents = best_latents  # corrected latents (argmin over candidates)
-
-            # update latents (predictor)
-            with torch.no_grad():
-                final_pred = sd3_timestep_pipe(
+                # with torch.enable_grad():
+                div_val, pred = estimate_divergence_hutchinson(
                     pipe,
-                    latents,
+                    proposal,
                     prompt_embeds,
                     pooled_prompt_embeds,
                     t,
+                    eps_list,
                     guidance_scale=7.0,
                     device="cuda",
                 )
+                # obj, pred = divergence_objective(div_val, args.optimize_target).detach()
+
+                if div_val.item() < best_div.item():
+                    best_div = div_val.detach()
+                    best_latents = proposal.detach()
+                    best_pred = pred.detach()
+
+                # latents = best_latents  # corrected latents (argmin over candidates)
+
+            # update latents (predictor)
+            with torch.no_grad():
+                # final_pred = sd3_timestep_pipe(
+                #     pipe,
+                #     best_latents,
+                #     prompt_embeds,
+                #     pooled_prompt_embeds,
+                #     t,
+                #     guidance_scale=7.0,
+                #     device="cuda",
+                # )
+                final_pred = best_pred
 
                 latents = update(
                     pipe,
-                    latents,
+                    best_latents,
                     t,
                     final_pred,
                     device="cuda",
@@ -303,7 +302,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--lr", type=float, default=0.1, help="Scale for corrector proposal radius (used with noise_scale)")
     parser.add_argument("--num_iters", type=int, default=1, help="Number of extra proposals per timestep (baseline always included)")
-    parser.add_argument("--num_samples", type=int, default=3, help="Number of Hutchinson probe vectors per divergence estimate")
+    parser.add_argument("--num_samples", type=int, default=1, help="Number of Hutchinson probe vectors per divergence estimate")
     parser.add_argument("--noise_scale", type=float, default=1e-3, help="Base scale for proposal perturbation")
     parser.add_argument("--lr_schedule", type=str, default="constant", help="Learning rate schedule")
     parser.add_argument("--t_until", type=int, default=-1, help="Apply corrector until this timestep index (inclusive); -1 means all timesteps")
