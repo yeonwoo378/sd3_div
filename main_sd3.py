@@ -147,7 +147,7 @@ def main(args):
     result_path = os.path.join("results", args.exp_name)
     os.makedirs(result_path, exist_ok=True)
 
-    for prompt_idx, prompt in enumerate(tqdm(prompts)):
+    for prompt_idx, prompt in enumerate(tqdm(prompts)): # batchsize=1
         # Encode prompt (no grads needed)
         with torch.no_grad():
             # encode_prompt: if prompt_2/prompt_3 is None, it falls back to prompt internally :contentReference[oaicite:2]{index=2}
@@ -194,38 +194,20 @@ def main(args):
             best_div = None
             best_pred = None
 
-            if args.num_iters > 0 and lr > 0.0 and args.noise_scale > 0.0:
-                # Generators for reproducibility per (prompt, timestep)
-                eps_gen = torch.Generator("cuda").manual_seed(args.seed + 100000 * prompt_idx + 10 * i + 1)
+            # Generators for reproducibility per (prompt, timestep)
+            eps_gen = torch.Generator("cuda").manual_seed(args.seed + 10 * i + 1)
 
-                # Hutchinson probes (shared across all candidate latents at this timestep)
-                eps_list = [
-                    _make_hutchinson_eps_like(latents, generator=eps_gen, dist=args.hutchinson_dist)
-                    for _ in range(args.num_samples)
-                ]
+            # Hutchinson probes (shared across all candidate latents at this timestep)
+            eps_list = [
+                _make_hutchinson_eps_like(latents, generator=eps_gen, dist=args.hutchinson_dist) # gaussain
+                for _ in range(args.num_samples)
+            ]
 
-                # Baseline candidate (no perturb)
-                # best_latents = latents.detach()
-                # with torch.enable_grad():
-                best_div, best_pred = estimate_divergence_hutchinson(
-                    pipe,
-                    best_latents,
-                    prompt_embeds,
-                    pooled_prompt_embeds,
-                    t,
-                    eps_list,
-                    guidance_scale=7.0,
-                    device="cuda",
-                )
-                # best_div = divergence_objective(base_div, args.optimize_target).detach()
-
-                # Proposals around current latents
-                # Use lr to scale proposal radius while keeping args.noise_scale as base.
-                sigma = float(lr) * float(args.noise_scale)
+            sigma = float(lr) * float(args.noise_scale)
 
             for iter in range(args.num_iters+1):
-                # if args.t_until != -1 and i > args.t_until:
-                #     break  # skip corrector after t_until
+                if args.t_until != -1 and i > args.t_until: # currently doing half
+                    break  # skip corrector after t_until
                 if iter == 0:
                     proposal = best_latents
                 else:
@@ -247,8 +229,6 @@ def main(args):
                     best_div = div_val.detach()
                     best_latents = proposal.detach()
                     best_pred = pred.detach()
-
-                # latents = best_latents  # corrected latents (argmin over candidates)
 
             # update latents (predictor)
             with torch.no_grad():
