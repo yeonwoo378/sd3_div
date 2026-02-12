@@ -79,11 +79,10 @@ def estimate_divergence_hutchinson(
             vp = torch.sum(pred * eps) / D
 
             # vjp = d/dx vp = (J^T eps) / D
-            # retain_graph must be True except for the last probe, because we reuse the same forward graph.
             vjp = torch.autograd.grad(
                 vp,
                 x,
-                # retain_graph=(s != n - 1),
+                retain_graph=False,
                 create_graph=False,
                 allow_unused=False,
             )[0]
@@ -190,18 +189,7 @@ def main(args):
             else:
                 raise ValueError(f"Unknown lr_schedule: {args.lr_schedule}")
 
-            # -----------------------------
-            # Divergence-based Corrector
-            # -----------------------------
-            # We compare candidates; we share the SAME Hutchinson probes eps across candidates at this timestep.
-            # Hutchinson: E[eps^T J eps] = Tr(J) :contentReference[oaicite:3]{index=3}
-            # Using shared eps reduces comparison noise (common random numbers).
-            #
-            # Candidates: baseline + (num_iters) noisy perturbations (small local search)
-            # Objective: minimize divergence magnitude (default: square)
-            #
-            # NOTE: num_iters here acts as "number of extra proposals" (baseline always included).
-            #
+            
             best_latents = latents.detach()
             best_div = None
             best_pred = None
@@ -209,7 +197,6 @@ def main(args):
             if args.num_iters > 0 and lr > 0.0 and args.noise_scale > 0.0:
                 # Generators for reproducibility per (prompt, timestep)
                 eps_gen = torch.Generator("cuda").manual_seed(args.seed + 100000 * prompt_idx + 10 * i + 1)
-                prop_gen = torch.Generator("cuda").manual_seed(args.seed + 100000 * prompt_idx + 10 * i + 1)
 
                 # Hutchinson probes (shared across all candidate latents at this timestep)
                 eps_list = [
@@ -241,13 +228,9 @@ def main(args):
                 #     break  # skip corrector after t_until
                 if iter == 0:
                     proposal = best_latents
-                elif i!=0:
-                    proposal = best_latents + sigma * torch.randn(best_latents.shape,  device=best_latents.device, dtype=best_latents.dtype, generator=prop_gen)
                 else:
-                    # geodesic interpolation at t=0
-                    proposal = best_latents * (1 - sigma) + sigma * torch.randn(best_latents.shape, device=best_latents.device, dtype=best_latents.dtype, generator=prop_gen) 
+                    proposal = best_latents + sigma * torch.randn(best_latents.shape,  device=best_latents.device, dtype=best_latents.dtype, generator=eps_gen)
 
-                # with torch.enable_grad():
                 div_val, pred = estimate_divergence_hutchinson(
                     pipe,
                     proposal,
@@ -269,15 +252,6 @@ def main(args):
 
             # update latents (predictor)
             with torch.no_grad():
-                # final_pred = sd3_timestep_pipe(
-                #     pipe,
-                #     best_latents,
-                #     prompt_embeds,
-                #     pooled_prompt_embeds,
-                #     t,
-                #     guidance_scale=7.0,
-                #     device="cuda",
-                # )
                 final_pred = best_pred
 
                 latents = update(
