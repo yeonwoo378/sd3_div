@@ -1,83 +1,66 @@
-import os
 import torch
-import numpy as np
-import argparse
-from tqdm import tqdm
-from diffusers import StableDiffusion3Pipeline
-from diffusers.utils.torch_utils import randn_tensor
-from PIL import Image
-import json
-import torch.nn.functional as F
 
-from utils import *
-from pipelines.sd3 import sd3_timestep_pipe, update, decode_latent
-from diffusers import FluxPipeline
+def flux_timestep_pipe(pipe, latents, prompt_embeds, pooled_prompt_embeds,
+                       text_ids, latent_image_ids, t,
+                       guidance_scale=3.5, device='cuda'):
+    # divergence_stepper creates delta/eps as float32, so perturbed_z may be float32.
+    # Cast to match the transformer dtype (same pattern as sd3_timestep_pipe).
+    latents = latents.to(prompt_embeds.dtype)
+    B, C, H, W = latents.shape
 
-pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16)
-pipe.enable_model_cpu_offload() #save some VRAM by offloading the model to CPU. Remove this if you have enough GPU power
+    # Pack (B, C, H, W) -> (B, H//2 * W//2, C*4)
+    packed = pipe._pack_latents(latents, B, C, H, W)
 
-prompt = "A cat holding a sign that says hello world"
-image = pipe(
-    prompt,
-    height=1024,
-    width=1024,
-    guidance_scale=3.5,
-    num_inference_steps=50,
-    max_sequence_length=512,
-    generator=torch.Generator("cpu").manual_seed(0)
-).images[0]
-image.save("flux-dev.png")
+    timestep = t.expand(packed.shape[0]).to(packed.dtype)
 
-def flux_timestep_pipe(pipe, latents, prompt_embeds, pooled_prompt_embeds, text_ids, t):
-    latents, latent_image_ids = pipe.prepare_latents(
-        1*1,
-        pipe.num_channels_latents,
-        512,
-        512,
-        prompt_embeds.dtype,
-        'cuda',
-        None,
-        latents,
-    )
+    # FLUX.1-dev uses distilled guidance; schnell ignores it
+    if pipe.transformer.config.guidance_embeds:
+        guidance = torch.full([1], guidance_scale, device=latents.device, dtype=torch.float32)
+        guidance = guidance.expand(packed.shape[0])
+    else:
+        guidance = None
 
-    guidance = 3.5
-    true_cfg_scale = 1.0
-    _current_timestep= t
-    timestep = t.expand(latents.shape[0]).to(latents.dtype)
     noise_pred = pipe.transformer(
-        hidden_states=latents,
+        hidden_states=packed,
         timestep=timestep / 1000,
         guidance=guidance,
         pooled_projections=pooled_prompt_embeds,
         encoder_hidden_states=prompt_embeds,
         txt_ids=text_ids,
         img_ids=latent_image_ids,
-        joint_attention_kwargs=pipe.joint_attention_kwargs,
+        joint_attention_kwargs=getattr(pipe, 'joint_attention_kwargs', None),
         return_dict=False,
     )[0]
+
+    # Unpack (B, seqlen, C*4) -> (B, C, H, W)
+    noise_pred = pipe._unpack_latents(
+        noise_pred,
+        height=H * pipe.vae_scale_factor,
+        width=W * pipe.vae_scale_factor,
+        vae_scale_factor=pipe.vae_scale_factor,
+    )
 
     return noise_pred
 
 
+@torch.no_grad()
+def update(pipe, latent, t, noise_pred, device='cuda'):
+    latents = latent.detach().to(device)
+    latents.requires_grad_(True)
 
-def sd3_timestep_pipe(pipe, latents, prompt_embeds, pooled_prompt_embeds, t,
-          guidance_scale=7.0, device='cuda'):
+    ret_latents = pipe.scheduler.step(
+        noise_pred,
+        t,
+        latents.detach(),
+        return_dict=False)[0]
 
-    # latents = latents.detach().to(device)
-    # latents.requires_grad_(True)
-            
-    latent_model_input = torch.cat([latents, latents], dim=0)
-                
-    timestep = t.expand(latent_model_input.shape[0])
-    noise_pred = pipe.transformer(
-        hidden_states=latent_model_input,
-        timestep=timestep,
-        encoder_hidden_states=prompt_embeds,
-        pooled_projections=pooled_prompt_embeds,
-        return_dict=False,
-    )[0]
+    return ret_latents
 
-    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-    noise_pred_guided = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond) # is actually v
 
-    return noise_pred_guided
+@torch.no_grad()
+def decode_latent(pipe, latents, ret_type='pil', device='cuda'):
+    assert latents.shape[0] == 1, "Only batch size of 1 is supported for decoding."
+    latents = (latents / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
+    image = pipe.vae.decode(latents.to(device), return_dict=False)[0]
+    image = pipe.image_processor.postprocess(image, output_type=ret_type)[0]
+    return image

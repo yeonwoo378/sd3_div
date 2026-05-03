@@ -13,7 +13,19 @@ import math
 from utils import *
 from pipelines.sd3 import sd3_timestep_pipe, update, decode_latent
 
-D = 16 * 64 * 64  # latent dimension (per sample) SD3
+BACKBONE_MODEL_IDS = {
+    "sd3-medium":        "stabilityai/stable-diffusion-3-medium-diffusers",
+    "sd3.5-medium":      "stabilityai/stable-diffusion-3.5-medium",
+    "sd3.5-large":       "stabilityai/stable-diffusion-3.5-large",
+    "sd3.5-large-turbo": "stabilityai/stable-diffusion-3.5-large-turbo",
+}
+
+BACKBONE_DEFAULT_RES = {
+    "sd3-medium":        512,
+    "sd3.5-medium":      512,
+    "sd3.5-large":       1024,
+    "sd3.5-large-turbo": 1024,
+}
 
 
 def get_scheduled_value(total, cur, schedule_type):
@@ -85,8 +97,9 @@ def estimate_divergence_hutchinson(
             # Important: eps should not require grad
             eps = eps.detach()
 
+            D_local = x.numel()
             # scalar: <pred, eps> / D  (divide-by-D is optional; keeps scale tame)
-            vp = torch.sum(pred * eps) / D
+            vp = torch.sum(pred * eps) / D_local
 
             # vjp = d/dx vp = (J^T eps) / D
             vjp = torch.autograd.grad(
@@ -98,7 +111,7 @@ def estimate_divergence_hutchinson(
             )[0]
 
             # eps^T J eps / D
-            div_s = torch.sum(vjp * eps).to(torch.float32)
+            div_s = (torch.sum(vjp * eps) / D_local).to(torch.float32)
             div_total = div_total + div_s
 
     div_avg = div_total / float(n)
@@ -130,9 +143,20 @@ def main(args):
     with open(os.path.join("results", args.exp_name, "config.json"), "w") as f:
         json.dump(vars(args), f, indent=4)
 
+    model_id = BACKBONE_MODEL_IDS[args.backbone]
+
+    # resolve height/width: explicit args override backbone defaults
+    height = args.height if args.height is not None else BACKBONE_DEFAULT_RES[args.backbone]
+    width  = args.width  if args.width  is not None else BACKBONE_DEFAULT_RES[args.backbone]
+    h_lat, w_lat = height // 8, width // 8
+    D = 16 * h_lat * w_lat
+
+    print(f"Backbone: {args.backbone}  ({model_id})")
+    print(f"Resolution: {height}x{width}  →  latent {h_lat}x{w_lat}  D={D}")
+
     # load pipeline
     pipe = StableDiffusion3Pipeline.from_pretrained(
-        "stabilityai/stable-diffusion-3-medium-diffusers",
+        model_id,
         torch_dtype=torch.float16,
     ).to("cuda")
     pipe.set_progress_bar_config(disable=True)
@@ -175,7 +199,7 @@ def main(args):
             device="cuda",
         )
 
-        shape = (1, 16, 64, 64)
+        shape = (1, 16, h_lat, w_lat)
         init_latent = randn_tensor(
             shape,
             dtype=torch.float16,
@@ -209,8 +233,8 @@ def main(args):
                 v_func=sd3_timestep_pipe,
                 v_func_kwargs=v_func_kwargs,
                 x_key='latents',
-                seed_delta=0,
-                seed_eps=42,
+                seed_delta=1234,
+                seed_eps=0,
                 num_updates=args.num_iters,
                 stop_t=0.5,
                 delta_scale=args.noise_scale * noise_scale,
@@ -238,8 +262,17 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Divergence-based corrector sampling for SD3 latents")
     parser.add_argument("--exp_name", type=str, default="debug", help="Name of the experiment")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--prompt_path", type=str, default="data.csv", help="Path to the prompt file")
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="sd3-medium",
+        choices=list(BACKBONE_MODEL_IDS.keys()),
+        help="Model backbone to use (sd3-medium | sd3.5-medium | sd3.5-large | sd3.5-large-turbo)",
+    )
+    parser.add_argument("--height", type=int, default=None, help="Image height in pixels (default: backbone-specific)")
+    parser.add_argument("--width",  type=int, default=None, help="Image width  in pixels (default: backbone-specific)")
 
     # parser.add_argument("--pert", type=float, default=0.1, help="Scale for corrector proposal radius (used with noise_scale)")
     parser.add_argument("--num_iters", type=int, default=1, help="Number of extra proposals per timestep (baseline always included)")

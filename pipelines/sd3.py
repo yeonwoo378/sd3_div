@@ -3,7 +3,7 @@ import torch.nn.functional as F
 # from utils import retrieve_timesteps
 
 def sd3_timestep_pipe(pipe, latents, prompt_embeds, pooled_prompt_embeds, t,
-          guidance_scale=3.0, device='cuda'):
+          guidance_scale=4.5, device='cuda'):
 
     # latents = latents.detach().to(device)
     # latents.requires_grad_(True)
