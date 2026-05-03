@@ -29,6 +29,11 @@ def main(args):
 
     # Load CLIP model
     clip_model, clip_preprocess = clip.load("ViT-L/14", device='cuda')
+    
+    clip_model_name = "openai/clip-vit-large-patch14"
+
+    processor, vision, head = load_aesthetic_models(clip_model_name, 'cuda')
+
 
     result_path = os.path.join("results", args.exp_name)
     results_dict = {}
@@ -37,6 +42,7 @@ def main(args):
     pick_score_list = []
     clip_score_list = []
     hpsv2_score_list = []
+    aes_score_list = []
     for prompt_idx, prompt in enumerate(tqdm(prompts)):
 
         # get ir
@@ -47,6 +53,8 @@ def main(args):
         clip_score = get_clipscore(clip_model, clip_preprocess, prompt, os.path.join(result_path, f"{prompt_idx:05d}.png"), device='cuda')
         # get hpsv2 score
         hpsv2_score = get_hpsv2(prompt, os.path.join(result_path, f"{prompt_idx:05d}.png"), device='cuda')
+        
+        aes_score = aesthetic_score(processor, vision, head, prompt, os.path.join(result_path, f"{prompt_idx:05d}.png"))
 
         results_dict[prompt_idx] = {
             "prompt": prompt,
@@ -54,17 +62,20 @@ def main(args):
             "ir_score": ir_score,
             "pick_score": pick_score,
             "clip_score": clip_score,
-            "hpsv2_score": hpsv2_score
+            "hpsv2_score": hpsv2_score,
+            'aes_score': aes_score
         }
         ir_score_list.append(ir_score)
         pick_score_list.append(pick_score)
         clip_score_list.append(clip_score)
         hpsv2_score_list.append(hpsv2_score)
+        aes_score_list.append(aes_score)
     results_dict["average"] = {
         "ir_score": np.mean(ir_score_list),
         "pick_score": np.mean(pick_score_list),
         "clip_score": np.mean(clip_score_list),
-        "hpsv2_score": np.mean(hpsv2_score_list)
+        "hpsv2_score": np.mean(hpsv2_score_list),
+        "aes_score": np.mean(aes_score_list)
     }
     
 
@@ -75,7 +86,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Example script with argparse")
     parser.add_argument("--exp_name", type=str, default="debug", help="Name of the experiment")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
+    # parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
     parser.add_argument("--prompt_path", type=str, default="data.csv", help="Path to the prompt file")
 
     args = parser.parse_args()

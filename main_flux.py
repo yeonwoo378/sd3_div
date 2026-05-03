@@ -3,12 +3,11 @@ import torch
 import numpy as np
 import argparse
 from tqdm import tqdm
-from diffusers import StableDiffusion3Pipeline
+from diffusers import FluxPipeline
 from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
 import json
 import torch.nn.functional as F
-import math
 
 from utils import *
 from pipelines.sd3 import sd3_timestep_pipe, update, decode_latent
@@ -16,29 +15,20 @@ from pipelines.sd3 import sd3_timestep_pipe, update, decode_latent
 D = 16 * 64 * 64  # latent dimension (per sample) SD3
 
 
-def get_scheduled_value(total, cur, schedule_type):
-    if schedule_type == 'constant': 
-        return total
-
-    elif schedule_type == 'linear': # 1 - (t/T)
-        return total * (1. - cur / total)
-    
-    elif schedule_type == 'cosine': 
-        return total * 0.5 * (1. + math.cos(math.pi * cur / total))
-    
-    elif schedule_type == 'sqrt':
-        return total * math.sqrt(1. - cur / total)
-    
-    elif schedule_type == 'concave':
-        return (1. - cur / total) ** 2
-    
-    elif schedule_type == 'convex':
-        return 1. - (cur / total) ** 2
-    
+def _make_hutchinson_eps_like(x: torch.Tensor, generator: torch.Generator, dist: str = "gaussian"):
+    """
+    Hutchinson probe vector eps with E[eps eps^T] = I.
+    gaussian: eps ~ N(0, I)
+    rademacher: eps_i in {-1, +1} (lower variance often; optional)
+    """
+    if dist == "gaussian":
+        return torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=generator)
+    elif dist == "rademacher":
+        # {0,1} -> {-1,+1}
+        r = torch.randint(0, 2, x.shape, device=x.device, generator=generator, dtype=torch.int8)
+        return (r * 2 - 1).to(dtype=x.dtype)
     else:
-        raise ValueError(f"Unknown schedule_type: {schedule_type}")
-
-
+        raise ValueError(f"Unknown Hutchinson dist: {dist}")
 
 
 def estimate_divergence_hutchinson(
@@ -131,10 +121,7 @@ def main(args):
         json.dump(vars(args), f, indent=4)
 
     # load pipeline
-    pipe = StableDiffusion3Pipeline.from_pretrained(
-        "stabilityai/stable-diffusion-3-medium-diffusers",
-        torch_dtype=torch.float16,
-    ).to("cuda")
+    pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16).to('cuda')
     pipe.set_progress_bar_config(disable=True)
     pipe.transformer.eval()
     pipe.vae.eval()
@@ -156,7 +143,6 @@ def main(args):
 
     result_path = os.path.join("results", args.exp_name)
     os.makedirs(result_path, exist_ok=True)
-    T = 1000
 
     for prompt_idx, prompt in enumerate(tqdm(prompts)): # batchsize=1
         # Encode prompt (no grads needed)
@@ -184,17 +170,26 @@ def main(args):
         )
 
         latents = init_latent.clone()
-        improved = None
-        delta = None
+
 
         for i, t in enumerate(timesteps):
             # lr schedule (keep your original logic)
+            if args.lr_schedule == "linear":
+                lr = args.lr * (1 - i / len(timesteps))
+            elif args.lr_schedule == "sqrt":
+                lr = args.lr * (1 - (i / len(timesteps)) ** 0.5)
+            elif args.lr_schedule == "cbrt":
+                lr = args.lr * (1 - (i / len(timesteps)) ** (1.0 / 3.0))
+            elif args.lr_schedule == "constant":
+                lr = args.lr
+ 
+            else:
+                raise ValueError(f"Unknown lr_schedule: {args.lr_schedule}")
+
             
             best_latents = latents.detach()
-            best_div = None
             best_pred = None
 
-            flow_t = 1. - t.item() / 1000
 
             v_func_kwargs = {
                 'pipe': pipe,
@@ -204,18 +199,16 @@ def main(args):
                 't': t,
                 # guidance_scale?
             }
-            noise_scale = get_scheduled_value(1.,flow_t, schedule_type=args.perturb_schedule)
-            best_latents, best_pred, improved, delta = divergence_stepper(
+
+            best_latents, best_pred = divergence_stepper(
                 v_func=sd3_timestep_pipe,
                 v_func_kwargs=v_func_kwargs,
                 x_key='latents',
-                seed_delta=0,
+                seed_delta=42,
                 seed_eps=42,
                 num_updates=args.num_iters,
                 stop_t=0.5,
-                delta_scale=args.noise_scale * noise_scale,
-                improved=improved,
-                delta=delta
+                delta_scale=args.noise_scale
 
                 )
 
@@ -241,11 +234,11 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
     parser.add_argument("--prompt_path", type=str, default="data.csv", help="Path to the prompt file")
 
-    # parser.add_argument("--pert", type=float, default=0.1, help="Scale for corrector proposal radius (used with noise_scale)")
+    parser.add_argument("--lr", type=float, default=0.1, help="Scale for corrector proposal radius (used with noise_scale)")
     parser.add_argument("--num_iters", type=int, default=1, help="Number of extra proposals per timestep (baseline always included)")
     parser.add_argument("--num_samples", type=int, default=1, help="Number of Hutchinson probe vectors per divergence estimate")
     parser.add_argument("--noise_scale", type=float, default=1e-3, help="Base scale for proposal perturbation")
-    parser.add_argument("--perturb_schedule", type=str, default="linear", help="Learning rate schedule")
+    parser.add_argument("--lr_schedule", type=str, default="linear", help="Learning rate schedule")
     parser.add_argument("--t_until", type=int, default=-1, help="Apply corrector until this timestep index (inclusive); -1 means all timesteps")
     parser.add_argument("--optimize_target", type=str, default="divergence", help="divergence | abs_divergence | raw_divergence")
 

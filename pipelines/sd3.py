@@ -3,12 +3,15 @@ import torch.nn.functional as F
 # from utils import retrieve_timesteps
 
 def sd3_timestep_pipe(pipe, latents, prompt_embeds, pooled_prompt_embeds, t,
-          guidance_scale=7.0, device='cuda'):
+          guidance_scale=3.0, device='cuda'):
 
     # latents = latents.detach().to(device)
     # latents.requires_grad_(True)
+    # T -> 0
+    # output v_pred from image to noise
+    # noise at
             
-    latent_model_input = torch.cat([latents, latents], dim=0)
+    latent_model_input = torch.cat([latents, latents], dim=0).to(prompt_embeds.dtype)
                 
     timestep = t.expand(latent_model_input.shape[0])
     noise_pred = pipe.transformer(
@@ -20,7 +23,7 @@ def sd3_timestep_pipe(pipe, latents, prompt_embeds, pooled_prompt_embeds, t,
     )[0]
 
     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-    noise_pred_guided = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+    noise_pred_guided = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond) # is actually v
 
     return noise_pred_guided
 
