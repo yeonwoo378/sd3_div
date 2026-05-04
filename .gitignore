@@ -1,7 +1,11 @@
 __pycache__/
 .ipynb_checkpoints/
 results/
-
+coco_val2014_30k_seed42/
+annotations/
+fid_coco30k
+val2014/
+val2014.zip
 *.ipynb
 *.pt
 *.pth
